@@ -3,6 +3,7 @@ package monks.formula.cache;
 import monks.formula.model.Order;
 
 import java.util.AbstractMap;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -15,7 +16,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
 import java.util.function.Function;
-import java.util.function.Predicate;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -60,19 +60,21 @@ public class OrderCache implements OrderCacheInterface {
 
     @Override
     public synchronized void cancelOrder(String orderId) {
-        cancelOrderWithPropertyMatch(order -> order.getOrderId().equalsIgnoreCase(orderId));
-        removeFromSecurityKeyWithOrdersMap(o -> o.getUser().equalsIgnoreCase(orderId));
+        removeOrder(orderId);
+        requiresUpdate.set(true);
     }
 
     @Override
     public synchronized void cancelOrdersForUser(String user) {
-        cancelOrderWithPropertyMatch(order -> order.getUser().equalsIgnoreCase(user));
-        removeFromSecurityKeyWithOrdersMap(o -> o.getUser().equalsIgnoreCase(user));
+        orders.entrySet().removeIf(e -> e.getValue().getKey().getUser().equals(user));
+        requiresUpdate.set(true);
     }
 
     @Override
     public synchronized void cancelOrdersForSecIdWithMinimumQty(String securityId, int minQty) {
-        cancelOrderWithPropertyMatch(order -> order.getSecurityId().equalsIgnoreCase(securityId) && order.getQty() <= minQty);
+        orders.entrySet().removeIf(e -> e.getValue().getKey().getUser().equals(securityId)
+        && e.getValue().getKey().getQty() >= minQty);
+        requiresUpdate.set(true);
     }
 
     @Override
@@ -142,6 +144,9 @@ public class OrderCache implements OrderCacheInterface {
         ConcurrentSkipListMap<Order, CopyOnWriteArrayList<Order>> orderLinkedListTreeMap = securityKeyWithOrdersMap.get(order.getSecurityId());
 
         if (orderLinkedListTreeMap != null) {
+
+            this.updateOrdersIfDeleted();
+
             if(order.getSide().equalsIgnoreCase("buy")){
                 ConcurrentNavigableMap<Order, CopyOnWriteArrayList<Order>> buyLowerThaSellTreeView = orderLinkedListTreeMap.headMap(order, false);
                 addMatchedOrdersToTree(buyLowerThaSellTreeView, order, "sell");
@@ -151,6 +156,16 @@ public class OrderCache implements OrderCacheInterface {
             }
         }
 
+    }
+
+    private void updateOrdersIfDeleted() {
+        List<Order> ordersToRemove = securityKeyWithOrdersMap.values().stream().map(ConcurrentSkipListMap::keySet)
+                .flatMap(Collection::stream).collect(Collectors.toList());
+        ordersToRemove.removeAll(orders.values().stream().map(AbstractMap.SimpleEntry::getKey).toList());
+
+        securityKeyWithOrdersMap.values()
+                .parallelStream()
+                .forEach(tree -> ordersToRemove.forEach(tree.keySet()::remove));
     }
 
     private void addMatchedOrdersToTree(ConcurrentNavigableMap<Order, CopyOnWriteArrayList<Order>> sellLowerThanBuyTreeView, Order order, String type) {
@@ -202,18 +217,8 @@ public class OrderCache implements OrderCacheInterface {
         };
     }
 
-    private void removeFromSecurityKeyWithOrdersMap(Predicate<Order> orderPredicate) {
-        securityKeyWithOrdersMap.values().forEach(treeMap -> {
-            treeMap.entrySet().removeIf(r -> orderPredicate.test(r.getKey()));
-        });
-        securityKeyWithOrdersMap.values().forEach(treeMap -> {
-            treeMap.values().forEach(list -> list.removeIf(orderPredicate));
-        });
-        requiresUpdate.set(true);
-    }
-
-    private synchronized void cancelOrderWithPropertyMatch(Predicate<Order> predicate){
-        orders.entrySet().removeIf(entry -> predicate.test(entry.getValue().getKey()));
+    private synchronized void removeOrder(String orderId){
+        orders.remove(orderId);
         requiresUpdate.set(true);
     }
 }
