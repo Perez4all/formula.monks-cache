@@ -3,20 +3,21 @@ package monks.formula.cache;
 import monks.formula.model.Order;
 
 import java.util.AbstractMap;
-import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
-import java.util.SortedMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiFunction;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class OrderCache implements OrderCacheInterface {
 
@@ -26,64 +27,31 @@ public class OrderCache implements OrderCacheInterface {
 
     private final Map<String, AtomicInteger> matchingSizes = new ConcurrentHashMap<>();
 
-    private final Map<String, AbstractMap.SimpleEntry<Order, AtomicBoolean>> buyOrders = new ConcurrentHashMap<>();
+    private final Map<String, AbstractMap.SimpleEntry<Order, AtomicBoolean>> orders = new ConcurrentHashMap<>();
 
     private final Comparator<Order> orderComparator; 
 
     public OrderCache(){
-        this.orderComparator = (o1, o2) -> {
-            if (o2.getQty() < o1.getQty()) {
-                return -1;
-            }
-            if (Objects.equals(o1.getOrderId(), o2.getOrderId())) {
-                return 0;
-            }
-            return 1;
-        };
+        this.orderComparator = Comparator.comparingInt(Order::getQty);
     }
 
     @Override
     public synchronized void addOrder(Order order) {
-        if (order.getSide().equalsIgnoreCase("sell")) {
-            addSellOrder(order);
+        orders.put(order.getOrderId(), new AbstractMap.SimpleEntry<>(order, new AtomicBoolean(false)));
+        if(securityKeyWithOrdersMap.containsKey(order.getSecurityId())){
+            ConcurrentSkipListMap<Order, CopyOnWriteArrayList<Order>> orderCopyOnWriteArrayListConcurrentSkipListMap = securityKeyWithOrdersMap.get(order.getSecurityId());
+            orderCopyOnWriteArrayListConcurrentSkipListMap.put(order, new CopyOnWriteArrayList<>());
         } else {
-            buyOrders.put(order.getOrderId(), new AbstractMap.SimpleEntry<>(order, new AtomicBoolean(false)));
+            ConcurrentSkipListMap<Order, CopyOnWriteArrayList<Order>> value = new ConcurrentSkipListMap<>(orderComparator);
+            securityKeyWithOrdersMap.put(order.getSecurityId(), value);
+            value.put(order, new CopyOnWriteArrayList<>());
         }
     }
 
-    private void addBuyOrder(Order order) {
-        ConcurrentSkipListMap<Order, CopyOnWriteArrayList<Order>> orderLinkedListTreeMap = securityKeyWithOrdersMap.get(order.getSecurityId());
-
-        if (orderLinkedListTreeMap != null) {
-
-            SortedMap<Order, CopyOnWriteArrayList<Order>> x = orderLinkedListTreeMap.headMap(order);
-
-            AtomicBoolean processed = new AtomicBoolean(false);
-
-            x.entrySet().stream()
-                    .sorted(Comparator.comparing(o -> o.getKey().getOrderId()))
-                    .forEachOrdered(entry -> {
-                        Order key = entry.getKey();
-                        if (key != null && !processed.get()) {
-                            orderLinkedListTreeMap.compute(key, (o, p) -> {
-                                if (p == null) {
-                                    p = new CopyOnWriteArrayList<>();
-                                }
-                                if (!key.getCompany().equalsIgnoreCase(order.getCompany())) {
-                                    p.add(order);
-                                    processed.set(true);
-                                }
-                                return p;
-                            });
-                        }
-                    });
-        }
-
-    }
-
-    private void addSellOrder(Order order) {
-        ConcurrentSkipListMap<Order, CopyOnWriteArrayList<Order>> existingTreeMap = securityKeyWithOrdersMap.computeIfAbsent(order.getSecurityId(), k -> new ConcurrentSkipListMap<>(orderComparator));
-        existingTreeMap.put(order, new CopyOnWriteArrayList<>());
+    @Override
+    public synchronized List<Order> getAllOrders() {
+        /* return Immutable list*/
+        return orders.values().stream().map(AbstractMap.SimpleEntry::getKey).collect(Collectors.toList());
     }
 
     @Override
@@ -98,15 +66,6 @@ public class OrderCache implements OrderCacheInterface {
         removeFromSecurityKeyWithOrdersMap(o -> o.getUser().equalsIgnoreCase(user));
     }
 
-    private void removeFromSecurityKeyWithOrdersMap(Predicate<Order> orderPredicate) {
-        securityKeyWithOrdersMap.values().forEach(treeMap -> {
-            treeMap.entrySet().removeIf(r -> orderPredicate.test(r.getKey()));
-        });
-        securityKeyWithOrdersMap.values().forEach(treeMap -> {
-            treeMap.values().forEach(list -> list.removeIf(orderPredicate));
-        });
-    }
-
     @Override
     public synchronized void cancelOrdersForSecIdWithMinimumQty(String securityId, int minQty) {
         cancelOrderWithPropertyMatch(order -> order.getSecurityId().equalsIgnoreCase(securityId) && order.getQty() <= minQty);
@@ -116,36 +75,118 @@ public class OrderCache implements OrderCacheInterface {
     public synchronized int getMatchingSizeForSecurity(String securityId) {
 
         int sum = 0;
-        buyOrders.values().stream()
-                .filter(orderBooleanSimpleEntry -> !orderBooleanSimpleEntry.getValue().get())
-                .map(AbstractMap.SimpleEntry::getKey)
-                .peek(this::addBuyOrder)
-                .forEach(o -> buyOrders.get(o.getOrderId()).getValue().set(true));
+        this.verifyAndPerformCacheUpdate();
 
         ConcurrentSkipListMap<Order, CopyOnWriteArrayList<Order>> orderLinkedListTreeMap = securityKeyWithOrdersMap.get(securityId);
         if(orderLinkedListTreeMap != null) {
             if (matchingSizes.containsKey(securityId)) {
                 sum = matchingSizes.get(securityId).get();
             } else {
-                sum = orderLinkedListTreeMap
-                        .values()
-                        .stream()
-                        .flatMap(Collection::stream)
-                        .mapToInt(Order::getQty)
-                        .sum();
+
+                Stream<Order> mergedMatchedOrders = getOrderStream(orderLinkedListTreeMap);
+
+                sum = mergedMatchedOrders
+                        .reduce(Map.of(
+                                "matchedQty", 0,
+                                "remainingBuyQty", 0,
+                                "remainingSellQty", 0
+                        ), matchOrdersReducer(), (a, b) -> a)
+                        .get("matchedQty");
+
                 matchingSizes.put(securityId, new AtomicInteger(sum));
             }
         }
         return sum;
     }
 
-    @Override
-    public synchronized List<Order> getAllOrders() {
-        /* return Immutable list*/
-        return buyOrders.values().stream().map(AbstractMap.SimpleEntry::getKey).collect(Collectors.toList());
+    private static Stream<Order> getOrderStream(ConcurrentSkipListMap<Order, CopyOnWriteArrayList<Order>> orderLinkedListTreeMap) {
+
+        Function<Map.Entry<Order, CopyOnWriteArrayList<Order>>, Stream<Order>> mergeOrders = e -> {
+            e.getValue().add(e.getKey());
+            return e.getValue().stream();
+        };
+
+        Stream<Map.Entry<Order, CopyOnWriteArrayList<Order>>> notMatchedOrdersSkipped = orderLinkedListTreeMap
+                .entrySet()
+                .stream()
+                .dropWhile(entry -> entry.getValue().isEmpty());
+
+        return notMatchedOrdersSkipped
+                .flatMap(mergeOrders)
+                .distinct();
+    }
+
+    private void matchOrdersAndCache(Order order) {
+
+        ConcurrentSkipListMap<Order, CopyOnWriteArrayList<Order>> orderLinkedListTreeMap = securityKeyWithOrdersMap.get(order.getSecurityId());
+
+        if (orderLinkedListTreeMap != null) {
+            if(order.getSide().equalsIgnoreCase("buy")){
+                ConcurrentNavigableMap<Order, CopyOnWriteArrayList<Order>> buyLowerThaSellTreeView = orderLinkedListTreeMap.headMap(order, false);
+                addMatchedOrdersToTree(buyLowerThaSellTreeView, order, "sell");
+            } else if (order.getSide().equalsIgnoreCase("sell")) {
+                ConcurrentNavigableMap<Order, CopyOnWriteArrayList<Order>> sellLowerThanBuyTreeView = orderLinkedListTreeMap.headMap(order, false);
+                addMatchedOrdersToTree(sellLowerThanBuyTreeView, order, "buy");
+            }
+        }
+
+    }
+
+    private void addMatchedOrdersToTree(ConcurrentNavigableMap<Order, CopyOnWriteArrayList<Order>> sellLowerThanBuyTreeView, Order order, String type) {
+        List<Order> ordersMatch = sellLowerThanBuyTreeView.keySet().stream()
+                .filter(orderCopyOnWriteArrayList -> !orderCopyOnWriteArrayList.getCompany()
+                        .equalsIgnoreCase(order.getCompany()) && orderCopyOnWriteArrayList.getSide().equalsIgnoreCase(type))
+                .toList();
+        ordersMatch.forEach(o -> {
+            if (!orders.get(o.getOrderId()).getValue().get()) {
+                CopyOnWriteArrayList<Order> linkedOrders = securityKeyWithOrdersMap.get(order.getSecurityId())
+                        .get(order);
+                if(linkedOrders != null) {
+                    linkedOrders.add(o);
+                }
+                setOrderProcessMatched(o);
+            }
+        });
+    }
+
+    private void setOrderProcessMatched(Order order) {
+        orders.get(order.getOrderId()).getValue().set(true);
+    }
+
+    private void verifyAndPerformCacheUpdate() {
+        orders.values().stream()
+                .filter(orderBooleanSimpleEntry -> !orderBooleanSimpleEntry.getValue().get())
+                .map(AbstractMap.SimpleEntry::getKey)
+                .forEach(this::matchOrdersAndCache);
+    }
+
+    private BiFunction<Map<String, Integer>, Order, Map<String, Integer>> matchOrdersReducer(){
+        return (matchesMap, order) -> {
+            if (order.getSide().equalsIgnoreCase("Buy")) {
+                int matched = Math.min(matchesMap.get("remainingSellQty"), order.getQty());
+                matchesMap.put("matchedQty", matchesMap.get("matchedQty") + matched);
+                matchesMap.put("remainingSellQty", matchesMap.get("remainingSellQty") - matched);
+                matchesMap.put("remainingBuyQty", matchesMap.get("remainingBuyQty") + order.getQty() - matched);
+            } else if (order.getSide().equalsIgnoreCase("Sell")) {
+                int matched = Math.min(matchesMap.get("remainingBuyQty"), order.getQty());
+                matchesMap.put("matchedQty", matchesMap.get("matchedQty") + matched);
+                matchesMap.put("remainingBuyQty", matchesMap.get("remainingBuyQty") - matched);
+                matchesMap.put("remainingSellQty", matchesMap.get("remainingSellQty") + order.getQty() - matched);
+            }
+            return matchesMap;
+        };
+    }
+
+    private void removeFromSecurityKeyWithOrdersMap(Predicate<Order> orderPredicate) {
+        securityKeyWithOrdersMap.values().forEach(treeMap -> {
+            treeMap.entrySet().removeIf(r -> orderPredicate.test(r.getKey()));
+        });
+        securityKeyWithOrdersMap.values().forEach(treeMap -> {
+            treeMap.values().forEach(list -> list.removeIf(orderPredicate));
+        });
     }
 
     private synchronized void cancelOrderWithPropertyMatch(Predicate<Order> predicate){
-        buyOrders.entrySet().removeIf(entry -> predicate.test(entry.getValue().getKey()));
+        orders.entrySet().removeIf(entry -> predicate.test(entry.getValue().getKey()));
     }
 }
