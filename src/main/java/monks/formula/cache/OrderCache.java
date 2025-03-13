@@ -4,6 +4,7 @@ import monks.formula.model.Order;
 
 import java.util.AbstractMap;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -29,7 +30,9 @@ public class OrderCache implements OrderCacheInterface {
 
     private final Map<String, AbstractMap.SimpleEntry<Order, AtomicBoolean>> orders = new ConcurrentHashMap<>();
 
-    private final Comparator<Order> orderComparator; 
+    private final Comparator<Order> orderComparator;
+
+    private final AtomicBoolean requiresUpdate = new AtomicBoolean(Boolean.FALSE);
 
     public OrderCache(){
         this.orderComparator = Comparator.comparingInt(Order::getQty);
@@ -46,6 +49,7 @@ public class OrderCache implements OrderCacheInterface {
             securityKeyWithOrdersMap.put(order.getSecurityId(), value);
             value.put(order, new CopyOnWriteArrayList<>());
         }
+        requiresUpdate.set(Boolean.TRUE);
     }
 
     @Override
@@ -74,28 +78,45 @@ public class OrderCache implements OrderCacheInterface {
     @Override
     public synchronized int getMatchingSizeForSecurity(String securityId) {
 
-        int sum = 0;
-        this.verifyAndPerformCacheUpdate();
-
         ConcurrentSkipListMap<Order, CopyOnWriteArrayList<Order>> orderLinkedListTreeMap = securityKeyWithOrdersMap.get(securityId);
+
+        int matchingSize = 0;
         if(orderLinkedListTreeMap != null) {
+            //Requires Update
+            boolean cacheUpdated = this.verifyAndUpdateOrdersMatchCache();
+
+            //Cache contains key
             if (matchingSizes.containsKey(securityId)) {
-                sum = matchingSizes.get(securityId).get();
+                //But was updated
+                if(cacheUpdated){
+                    //Recalculate
+                    matchingSize = calculateMatchingSize(securityId, orderLinkedListTreeMap);
+                } else {
+                    //Return from cache
+                    matchingSize = matchingSizes.get(securityId).get();
+                }
             } else {
-
-                Stream<Order> mergedMatchedOrders = getOrderStream(orderLinkedListTreeMap);
-
-                sum = mergedMatchedOrders
-                        .reduce(Map.of(
-                                "matchedQty", 0,
-                                "remainingBuyQty", 0,
-                                "remainingSellQty", 0
-                        ), matchOrdersReducer(), (a, b) -> a)
-                        .get("matchedQty");
-
-                matchingSizes.put(securityId, new AtomicInteger(sum));
+                //Calculate new
+                matchingSize = calculateMatchingSize(securityId, orderLinkedListTreeMap);
             }
         }
+        return matchingSize;
+    }
+
+    private int calculateMatchingSize(String securityId, ConcurrentSkipListMap<Order, CopyOnWriteArrayList<Order>> orderLinkedListTreeMap) {
+        int sum;
+        Stream<Order> mergedMatchedOrders = getOrderStream(orderLinkedListTreeMap);
+
+        final Map<String, Integer> matchesMap = new HashMap<>();
+        matchesMap.put("matchedQty", 0);
+        matchesMap.put("remainingBuyQty", 0);
+        matchesMap.put("remainingSellQty", 0);
+
+        sum = mergedMatchedOrders
+                .reduce(matchesMap, matchOrdersReducer(), (a, b) -> a)
+                .get("matchedQty");
+
+        matchingSizes.put(securityId, new AtomicInteger(sum));
         return sum;
     }
 
@@ -153,11 +174,15 @@ public class OrderCache implements OrderCacheInterface {
         orders.get(order.getOrderId()).getValue().set(true);
     }
 
-    private void verifyAndPerformCacheUpdate() {
-        orders.values().stream()
-                .filter(orderBooleanSimpleEntry -> !orderBooleanSimpleEntry.getValue().get())
-                .map(AbstractMap.SimpleEntry::getKey)
-                .forEach(this::matchOrdersAndCache);
+    private boolean verifyAndUpdateOrdersMatchCache() {
+        if(requiresUpdate.get()) {
+            orders.values().stream()
+                    .filter(orderBooleanSimpleEntry -> !orderBooleanSimpleEntry.getValue().get())
+                    .map(AbstractMap.SimpleEntry::getKey)
+                    .forEach(this::matchOrdersAndCache);
+            return true;
+        }
+        return false;
     }
 
     private BiFunction<Map<String, Integer>, Order, Map<String, Integer>> matchOrdersReducer(){
@@ -184,9 +209,11 @@ public class OrderCache implements OrderCacheInterface {
         securityKeyWithOrdersMap.values().forEach(treeMap -> {
             treeMap.values().forEach(list -> list.removeIf(orderPredicate));
         });
+        requiresUpdate.set(true);
     }
 
     private synchronized void cancelOrderWithPropertyMatch(Predicate<Order> predicate){
         orders.entrySet().removeIf(entry -> predicate.test(entry.getValue().getKey()));
+        requiresUpdate.set(true);
     }
 }
