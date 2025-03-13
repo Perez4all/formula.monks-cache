@@ -16,13 +16,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
 import java.util.function.Function;
-import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class OrderCache implements OrderCacheInterface {
-
-    private static final Logger log = Logger.getLogger(OrderCache.class.getName());
 
     private final Map<String, ConcurrentSkipListMap<Order, CopyOnWriteArrayList<Order>>> securityKeyWithOrdersMap = new ConcurrentHashMap<>();
 
@@ -30,13 +27,9 @@ public class OrderCache implements OrderCacheInterface {
 
     private final Map<String, AbstractMap.SimpleEntry<Order, AtomicBoolean>> orders = new ConcurrentHashMap<>();
 
-    private final Comparator<Order> orderComparator;
+    private final Comparator<Order> orderComparator = Comparator.comparingInt(Order::getQty);
 
     private final AtomicBoolean requiresUpdate = new AtomicBoolean(Boolean.FALSE);
-
-    public OrderCache(){
-        this.orderComparator = Comparator.comparingInt(Order::getQty);
-    }
 
     @Override
     public synchronized void addOrder(Order order) {
@@ -54,7 +47,6 @@ public class OrderCache implements OrderCacheInterface {
 
     @Override
     public synchronized List<Order> getAllOrders() {
-        /* return Immutable list*/
         return orders.values().stream().map(AbstractMap.SimpleEntry::getKey).collect(Collectors.toList());
     }
 
@@ -66,45 +58,46 @@ public class OrderCache implements OrderCacheInterface {
 
     @Override
     public synchronized void cancelOrdersForUser(String user) {
-        orders.entrySet().removeIf(e -> e.getValue().getKey().getUser().equals(user));
+        orders.entrySet().removeIf(entry -> entry.getValue().getKey().getUser().equalsIgnoreCase(user));
         requiresUpdate.set(true);
     }
 
     @Override
     public synchronized void cancelOrdersForSecIdWithMinimumQty(String securityId, int minQty) {
-        orders.entrySet().removeIf(e -> e.getValue().getKey().getUser().equals(securityId)
-        && e.getValue().getKey().getQty() >= minQty);
+        orders.entrySet().removeIf(entry -> entry.getValue().getKey().getSecurityId().equals(securityId)
+            && entry.getValue().getKey().getQty() >= minQty);
         requiresUpdate.set(true);
     }
 
     @Override
     public synchronized int getMatchingSizeForSecurity(String securityId) {
-
         ConcurrentSkipListMap<Order, CopyOnWriteArrayList<Order>> orderLinkedListTreeMap = securityKeyWithOrdersMap.get(securityId);
 
         int matchingSize = 0;
         if(orderLinkedListTreeMap != null) {
-            //Requires Update
             boolean cacheUpdated = this.verifyAndUpdateOrdersMatchCache();
 
-            //Cache contains key
             if (matchingSizes.containsKey(securityId)) {
-                //But was updated
                 if(cacheUpdated){
-                    //Recalculate
                     matchingSize = calculateMatchingSize(securityId, orderLinkedListTreeMap);
                 } else {
-                    //Return from cache
                     matchingSize = matchingSizes.get(securityId).get();
                 }
             } else {
-                //Calculate new
                 matchingSize = calculateMatchingSize(securityId, orderLinkedListTreeMap);
             }
         }
         return matchingSize;
     }
 
+
+    /**
+     * Calculates the matching size for the given security ID.
+     *
+     * @param securityId the ID of the security
+     * @param orderLinkedListTreeMap the map of orders
+     * @return the matching size
+     */
     private int calculateMatchingSize(String securityId, ConcurrentSkipListMap<Order, CopyOnWriteArrayList<Order>> orderLinkedListTreeMap) {
         int sum;
         Stream<Order> mergedMatchedOrders = getOrderStream(orderLinkedListTreeMap);
@@ -122,8 +115,13 @@ public class OrderCache implements OrderCacheInterface {
         return sum;
     }
 
+    /**
+     * Returns a stream of orders from the given map.
+     *
+     * @param orderLinkedListTreeMap the map of orders
+     * @return a stream of orders
+     */
     private static Stream<Order> getOrderStream(ConcurrentSkipListMap<Order, CopyOnWriteArrayList<Order>> orderLinkedListTreeMap) {
-
         Function<Map.Entry<Order, CopyOnWriteArrayList<Order>>, Stream<Order>> mergeOrders = e -> {
             e.getValue().add(e.getKey());
             return e.getValue().stream();
@@ -139,12 +137,15 @@ public class OrderCache implements OrderCacheInterface {
                 .distinct();
     }
 
+    /**
+     * Matches orders and updates the cache.
+     *
+     * @param order the order to be matched
+     */
     private void matchOrdersAndCache(Order order) {
-
         ConcurrentSkipListMap<Order, CopyOnWriteArrayList<Order>> orderLinkedListTreeMap = securityKeyWithOrdersMap.get(order.getSecurityId());
 
         if (orderLinkedListTreeMap != null) {
-
             this.updateOrdersIfDeleted();
 
             if(order.getSide().equalsIgnoreCase("buy")){
@@ -155,9 +156,11 @@ public class OrderCache implements OrderCacheInterface {
                 addMatchedOrdersToTree(sellLowerThanBuyTreeView, order, "buy");
             }
         }
-
     }
 
+    /**
+     * Updates orders if they have been deleted.
+     */
     private void updateOrdersIfDeleted() {
         List<Order> ordersToRemove = securityKeyWithOrdersMap.values().stream().map(ConcurrentSkipListMap::keySet)
                 .flatMap(Collection::stream).collect(Collectors.toList());
@@ -168,6 +171,13 @@ public class OrderCache implements OrderCacheInterface {
                 .forEach(tree -> ordersToRemove.forEach(tree.keySet()::remove));
     }
 
+    /**
+     * Adds matched orders to the tree.
+     *
+     * @param sellLowerThanBuyTreeView the map of orders view
+     * @param order the order to be added
+     * @param type the type of order (Buy, Sell)
+     */
     private void addMatchedOrdersToTree(ConcurrentNavigableMap<Order, CopyOnWriteArrayList<Order>> sellLowerThanBuyTreeView, Order order, String type) {
         List<Order> ordersMatch = sellLowerThanBuyTreeView.keySet().stream()
                 .filter(orderCopyOnWriteArrayList -> !orderCopyOnWriteArrayList.getCompany()
@@ -185,10 +195,20 @@ public class OrderCache implements OrderCacheInterface {
         });
     }
 
+    /**
+     * Sets an order as processed and matched.
+     *
+     * @param order the order to be set
+     */
     private void setOrderProcessMatched(Order order) {
         orders.get(order.getOrderId()).getValue().set(true);
     }
 
+    /**
+     * Verifies and updates the orders match cache.
+     *
+     * @return true if the cache was updated, false otherwise
+     */
     private boolean verifyAndUpdateOrdersMatchCache() {
         if(requiresUpdate.get()) {
             orders.values().stream()
@@ -200,6 +220,11 @@ public class OrderCache implements OrderCacheInterface {
         return false;
     }
 
+    /**
+     * Returns a reducer function to match orders.
+     *
+     * @return a reducer function
+     */
     private BiFunction<Map<String, Integer>, Order, Map<String, Integer>> matchOrdersReducer(){
         return (matchesMap, order) -> {
             if (order.getSide().equalsIgnoreCase("Buy")) {
@@ -217,6 +242,11 @@ public class OrderCache implements OrderCacheInterface {
         };
     }
 
+    /**
+     * Removes an order from the cache.
+     *
+     * @param orderId the ID of the order to be removed
+     */
     private synchronized void removeOrder(String orderId){
         orders.remove(orderId);
         requiresUpdate.set(true);
